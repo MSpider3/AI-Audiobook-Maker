@@ -1,7 +1,7 @@
 # The AI Audiobook Factory  Audiobook
 
 ![Python](https://img.shields.io/badge/Python-3.10%2B-blue)
-![License](https://img.shields.io/badge/License-MIT-green)
+![License](https://img.shields.io/badge/License-Apache%202.0-blue)
 
 This project is a complete, end-to-end Python-based pipeline for converting e-books (in EPUB format) into high-quality, chapterized audiobooks with synchronised, sentence-level lyrics.
 
