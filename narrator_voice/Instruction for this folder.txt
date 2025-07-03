@@ -1,0 +1,12 @@
+In this folder you will keep the voice for your audiobook that you wish to clone.
+
+Things to keep in mind while selecting narrator voice:
+- Take 10-15 second audio clip in .wav format of narrator.
+- In that voice clip it has best narration in single voice of that narrator (meaning that narrator shouldn't be speaking in different styles across the entire clip, it should be same).
+
+How you can do it?
+- Open chatbot of your choice and ask them what voice would fit best for the novel you want to convert.
+- Find their best works and download the sample of their.
+- Convert from .mp3 to .wav format.
+- Trim the best part of the sample if the clip is long suing any audio editing software/website.
+- and the place them in this folder.

@@ -1,0 +1,4 @@
+In this folder you will keep the book/novel of your choice.
+And make sure they are in .epub file format.
+This script works best with EPUB file.
+If you have PDF, you can convert into EPUB.

@@ -1,0 +1,1 @@
+Enter the best text of your book and and change the temperatures and tts top p to see which output sound the best.
