@@ -3,6 +3,7 @@ import shutil
 import subprocess
 import torch
 import numpy as np
+import json
 from scipy.io.wavfile import write as write_wav
 import ebooklib
 from ebooklib import epub
@@ -35,6 +36,37 @@ speaker_embedding_global = None
 # =========================
 # === HELPER FUNCTIONS  ===
 # =========================
+
+def update_progress_file(progress_path, chapter_num, status):
+    """
+    Updates the progress JSON file for a specific chapter.
+    """
+    with open(progress_path, 'r', encoding='utf-8') as f:
+        progress_data = json.load(f)
+    for chapter in progress_data["chapters"]:
+        if chapter["num"] == chapter_num:
+            chapter["status"] = status
+            break
+    with open(progress_path, 'w', encoding='utf-8') as f:
+        json.dump(progress_data, f, indent=4)
+
+def load_or_create_progress_file(progress_path, chapters_data):
+    """Loads a progress file if it exists, otherwise creates a new one."""
+    if os.path.exists(progress_path):
+        print("Found existing progress file. Loading state.")
+        with open(progress_path, 'r', encoding='utf-8') as f:
+            return json.load(f)
+    else:
+        print("No progress file found. Creating a new one.")
+        progress_data = {
+            "book_title": chapters_data[0].get("book_title", "Unknown"),
+            "chapters": [
+                {"num": c["num"], "title": c["title"], "status": "pending"} for c in chapters_data
+            ]
+        }
+        with open(progress_path, 'w', encoding='utf-8') as f:
+            json.dump(progress_data, f, indent=4)
+        return progress_data
 
 def format_lrc_timestamp(seconds):
     """
@@ -237,7 +269,15 @@ def main(args):
     book_output_dir = os.path.join(os.getcwd(), args.book_title)
     audio_chapters_dir = os.path.join(book_output_dir, "audio_chapters")
     os.makedirs(audio_chapters_dir, exist_ok=True)
-    
+
+    # --- Extract chapters from the EPUB file FIRST ---
+    chapters = extract_chapters_from_epub(args.epub_file, args.skip_start, args.skip_end)
+    total_chapters = len(chapters)
+
+    # --- Now load or create the progress file ---
+    progress_path = os.path.join(book_output_dir, "progress.json")
+    progress_data = load_or_create_progress_file(progress_path, chapters)
+
     print("Initializing lightweight text splitter...")
     splitter_tts = TTS(args.tts_model_name)  # Used only for sentence splitting, not for audio
     print("Splitter ready.")
@@ -256,7 +296,16 @@ def main(args):
         chapter_num = chapter_info["num"]
         chapter_title = chapter_info["title"]
         chapter_text = chapter_info["text"]
-        
+
+        # Check progress file for this chapter's status
+        chapter_progress = next((c for c in progress_data["chapters"] if c["num"] == chapter_num), None)
+        if chapter_progress and chapter_progress.get("status") == "done":
+            print(f"Chapter {chapter_num} already marked as done in progress file. Skipping.")
+            continue
+
+        # Mark as in_progress before starting
+        update_progress_file(progress_path, chapter_num, "in_progress")
+
         chapter_audio_path = os.path.join(audio_chapters_dir, f"chapter_{chapter_num:04d}.mp3")
         
         print(f"\n>>> Processing Chapter {chapter_num}/{total_chapters}: {chapter_title}")
@@ -381,6 +430,9 @@ def main(args):
         shutil.rmtree(temp_chunk_folder)
         print(f"--- Successfully completed and finalized Chapter {chapter_num} ---")
 
+        # Mark as done after finishing
+        update_progress_file(progress_path, chapter_num, "done")
+
     # --- All chapters done ---
     print("\n--- All chapters processed! Shutting down worker process... ---")
     job_queue.put("STOP")  # Tell the worker process to exit
@@ -391,30 +443,32 @@ def main(args):
     print(f"Total processing time: {total_time/3600:.2f} hours.")
     print(f"Your chapterized audiobook is ready in: '{audio_chapters_dir}'")
 
-# ===============================
-# === ENTRY POINT / ARGPARSE  ===
-# ===============================
-
-if __name__ == "__main__":
-    # Required for multiprocessing to work reliably on Windows and macOS
-    try:
-        set_start_method('spawn', force=True)
-    except RuntimeError:
-        pass
-
     # --- Parse command-line arguments ---
     parser = argparse.ArgumentParser(description="The Audiobook Factory: Generate a complete audiobook from an EPUB file.")
     
+    # All of these arguments are required, you can change the default values to your own
+    # OR you can use the commented-out versions to set default values
     parser.add_argument("--epub_file", type=str, required=True, help="Path to the input EPUB file.")
+    # OR
+   #parser.add_argument("-i", "--epub_file", type=str, default="./Your_Novel/ORV Vol. 1.epub", help="Path to the input EPUB file.")
+     
     parser.add_argument("--voice_file", type=str, required=True, help="Path to the narrator's voice sample WAV file.")
+    # OR
+   #parser.add_argument("-v", "--voice_file", type=str, default="./narrator_voice/orv_narrator_voice.wav", help="Path to the narrator's voice sample WAV file.") 
+   
     parser.add_argument("--book_title", type=str, required=True, help="The name of the book, used for the output folder.")
-    parser.add_argument("--skip_start", type=int, default=6, help="Number of 'chapters' to skip at the beginning of the EPUB.")
-    parser.add_argument("--skip_end", type=int, default=1, help="Number of 'chapters' to skip at the end of the EPUB.")
+    #OR
+   #parser.add_argument("-b", "--book_title", type=str, default="ORV Vol. 1", help="The name of the book, used for the output folder.") 
+    
+    parser.add_argument("--skip_start", type=int, default=6, help="Number of 'chapters' to skip at the beginning of the EPUB.") # Change this to any number of chapter according to your book to skip the preface and introduction
+    parser.add_argument("--skip_end", type=int, default=1, help="Number of 'chapters' to skip at the end of the EPUB.") # Change this to any number of chapter according to your book to skip the appendix or afterword
     parser.add_argument("--pause", type=float, default=0.5, help="Seconds of silence to add between sentences.")
     parser.add_argument("--para_pause", type=float, default=1.2, help="A longer pause in seconds for paragraph breaks.")
-    parser.add_argument("--max_len", type=int, default=240, help="Maximum character length for a single text chunk.")
-    parser.add_argument("--temperature", type=float, default=0.8, help="TTS generation temperature.")
-    parser.add_argument("--top_p", type=float, default=0.8, help="TTS generation top_p.")
+    parser.add_argument("--max_len", type=int, default=240, help="Maximum character length for a single text chunk.") # Do not change this value this is the maximum length of a single text chunk that the TTS model can handle, if you change this value it will break the code, you decrease this value if you want to split the text into smaller chunks, but it is not recommended to increase this value.
+    parser.add_argument("--temperature", type=float, default=0.8, help="TTS generation temperature.") # Change this value to control the randomness of the TTS generation, lower values make it more deterministic, higher values make it more creative.
+    parser.add_argument("--top_p", type=float, default=0.8, help="TTS generation top_p.") # Change this value to control the diversity of the TTS generation, lower values make it more deterministic, higher values make it more creative.
+    
+    # Do not change these values unless you know what you are doing 
     parser.add_argument("--collector_timeout", type=int, default=300, help="Seconds the collector will wait for a result.")
     parser.add_argument("--force_reprocess", action="store_true", help="Force reprocessing of all chapters, ignoring existing audio files.")
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu", help="Device for TTS ('cuda' or 'cpu').")
