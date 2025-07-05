@@ -126,6 +126,11 @@ python audiobook_factory.py ^
   --top_p 0.8
 ```
 
+OR
+
+```bash
+python audiobook_factory.py # You can change the values in the script directly
+```
 The script will start, initialise the worker process (this may take a few minutes), and then begin processing. You can stop this process at any time and re-run the exact same command to resume where you left off.
 
 ### Step 4: Enjoy!
