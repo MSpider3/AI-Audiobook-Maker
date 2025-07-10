@@ -125,52 +125,56 @@ def extract_chapters_from_epub(epub_path, skip_start, skip_end):
 
 def robust_sentence_splitter(text, tts_synthesizer, max_len):
     """
-    Splits a large block of text into smaller chunks for TTS.
-    - Splits by paragraphs first, then by sentences.
-    - If a sentence is too long, splits by words to keep each chunk <= max_len characters.
-    - Marks the end of paragraphs for longer pauses.
-    Returns a list of dicts: {text, is_para_end}
+    A more advanced sentence splitter that is paragraph-aware and also
+    intelligently splits long sentences at natural punctuation boundaries.
     """
-    print("Splitting text into paragraph-aware chunks...")
-    paragraphs = text.split('\n\n')  # Split by double newlines (paragraphs)
+    print("Splitting text into intelligent, paragraph-aware chunks...")
+    paragraphs = text.split('\n\n')
     final_chunks = []
     
     for para_index, para in enumerate(paragraphs):
-        cleaned_para = para.replace('\n', ' ').strip()  # Remove single newlines and extra spaces
-        if not cleaned_para:
-            continue  # Skip empty paragraphs
+        cleaned_para = para.replace('\n', ' ').strip()
+        if not cleaned_para: continue
         
-        # Use TTS's built-in sentence splitter for better accuracy
         sentences_from_para = tts_synthesizer.split_into_sentences(cleaned_para)
         
         for sent_index, sentence in enumerate(sentences_from_para):
-            sanitized_sentence = sentence.strip(" \"'")  # Remove leading/trailing quotes and spaces
-            # Skip empty or non-alphanumeric sentences
-            if not sanitized_sentence or not any(c.isalnum() for c in sanitized_sentence):
-                continue
+            sanitized_sentence = sentence.strip(" \"'")
+            if not sanitized_sentence or not any(c.isalnum() for c in sanitized_sentence): continue
 
-            is_paragraph_end = (sent_index == len(sentences_from_para) - 1)  # True if last sentence in paragraph
+            is_paragraph_end = (sent_index == len(sentences_from_para) - 1)
 
+            # --- NEW, SMARTER SPLITTING LOGIC ---
             if len(sanitized_sentence) <= max_len:
-                # Sentence fits within max_len, add as is
                 final_chunks.append({"text": sanitized_sentence, "is_para_end": is_paragraph_end})
             else:
-                # Sentence is too long, split by words
-                words = sanitized_sentence.split()
-                current_sub_chunk_words = []
-                for word_index, word in enumerate(words):
-                    is_last_word_of_sentence = (word_index == len(words) - 1)
-                    next_len = len(" ".join(current_sub_chunk_words + [word]))
-                    if next_len > max_len and current_sub_chunk_words:
-                        # Current chunk is full, add it
-                        final_chunks.append({"text": " ".join(current_sub_chunk_words), "is_para_end": False})
-                        current_sub_chunk_words = [word]
-                    else:
-                        current_sub_chunk_words.append(word)
+                # The sentence is too long. We must split it intelligently.
+                current_sentence_part = sanitized_sentence
+                while len(current_sentence_part) > max_len:
+                    # Find the last natural break point (punctuation) before the max length
+                    split_pos = -1
+                    for delimiter in ['.', ',', ';', ':', '—']:
+                        pos = current_sentence_part.rfind(delimiter, 0, max_len)
+                        if pos > split_pos:
+                            split_pos = pos
+                    
+                    if split_pos == -1:
+                        # No natural break found, fall back to the last space
+                        split_pos = current_sentence_part.rfind(' ', 0, max_len)
+                    
+                    if split_pos == -1:
+                        # No spaces found either, hard-cut the sentence (very rare)
+                        split_pos = max_len - 1
+
+                    # Add the first part of the split sentence
+                    final_chunks.append({"text": current_sentence_part[:split_pos+1].strip(), "is_para_end": False})
+                    # The remainder becomes the new part to process
+                    current_sentence_part = current_sentence_part[split_pos+1:].strip()
                 
-                if current_sub_chunk_words:
-                    # Add the last chunk, mark paragraph end if appropriate
-                    final_chunks.append({"text": " ".join(current_sub_chunk_words), "is_para_end": is_paragraph_end})
+                # Add the final remaining part of the sentence
+                if current_sentence_part:
+                    final_chunks.append({"text": current_sentence_part, "is_para_end": is_paragraph_end})
+
     return final_chunks
 
 
@@ -443,6 +447,17 @@ def main(args):
     print(f"Total processing time: {total_time/3600:.2f} hours.")
     print(f"Your chapterized audiobook is ready in: '{audio_chapters_dir}'")
 
+# ===============================
+# === ENTRY POINT / ARGPARSE  ===
+# ===============================
+
+if __name__ == "__main__":
+    # Required for multiprocessing to work reliably on Windows and macOS
+    try:
+        set_start_method('spawn', force=True)
+    except RuntimeError:
+        pass
+
     # --- Parse command-line arguments ---
     parser = argparse.ArgumentParser(description="The Audiobook Factory: Generate a complete audiobook from an EPUB file.")
     
@@ -459,16 +474,13 @@ def main(args):
     parser.add_argument("--book_title", type=str, required=True, help="The name of the book, used for the output folder.")
     #OR
    #parser.add_argument("-b", "--book_title", type=str, default="ORV Vol. 1", help="The name of the book, used for the output folder.") 
-    
-    parser.add_argument("--skip_start", type=int, default=6, help="Number of 'chapters' to skip at the beginning of the EPUB.") # Change this to any number of chapter according to your book to skip the preface and introduction
-    parser.add_argument("--skip_end", type=int, default=1, help="Number of 'chapters' to skip at the end of the EPUB.") # Change this to any number of chapter according to your book to skip the appendix or afterword
+    parser.add_argument("--skip_start", type=int, default=6, help="Number of 'chapters' to skip at the beginning of the EPUB.")
+    parser.add_argument("--skip_end", type=int, default=1, help="Number of 'chapters' to skip at the end of the EPUB.")
     parser.add_argument("--pause", type=float, default=0.5, help="Seconds of silence to add between sentences.")
     parser.add_argument("--para_pause", type=float, default=1.2, help="A longer pause in seconds for paragraph breaks.")
-    parser.add_argument("--max_len", type=int, default=240, help="Maximum character length for a single text chunk.") # Do not change this value this is the maximum length of a single text chunk that the TTS model can handle, if you change this value it will break the code, you decrease this value if you want to split the text into smaller chunks, but it is not recommended to increase this value.
-    parser.add_argument("--temperature", type=float, default=0.8, help="TTS generation temperature.") # Change this value to control the randomness of the TTS generation, lower values make it more deterministic, higher values make it more creative.
-    parser.add_argument("--top_p", type=float, default=0.8, help="TTS generation top_p.") # Change this value to control the diversity of the TTS generation, lower values make it more deterministic, higher values make it more creative.
-    
-    # Do not change these values unless you know what you are doing 
+    parser.add_argument("--max_len", type=int, default=240, help="Maximum character length for a single text chunk.")
+    parser.add_argument("--temperature", type=float, default=0.8, help="TTS generation temperature.")
+    parser.add_argument("--top_p", type=float, default=0.8, help="TTS generation top_p.")
     parser.add_argument("--collector_timeout", type=int, default=300, help="Seconds the collector will wait for a result.")
     parser.add_argument("--force_reprocess", action="store_true", help="Force reprocessing of all chapters, ignoring existing audio files.")
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu", help="Device for TTS ('cuda' or 'cpu').")
