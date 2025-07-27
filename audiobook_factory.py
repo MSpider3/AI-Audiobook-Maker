@@ -50,7 +50,7 @@ def update_progress_file(progress_path, chapter_num, status):
     with open(progress_path, 'w', encoding='utf-8') as f:
         json.dump(progress_data, f, indent=4)
 
-def load_or_create_progress_file(progress_path, chapters_data):
+def load_or_create_progress_file(progress_path, chapters_data, book_title):
     """Loads a progress file if it exists, otherwise creates a new one."""
     if os.path.exists(progress_path):
         print("Found existing progress file. Loading state.")
@@ -59,7 +59,7 @@ def load_or_create_progress_file(progress_path, chapters_data):
     else:
         print("No progress file found. Creating a new one.")
         progress_data = {
-            "book_title": chapters_data[0].get("book_title", "Unknown"),
+            "book_title": book_title,
             "chapters": [
                 {"num": c["num"], "title": c["title"], "status": "pending"} for c in chapters_data
             ]
@@ -233,16 +233,11 @@ def tts_consumer(job_queue, results_queue, args):
             # Convert float audio to int16 for WAV format
             int16_wav_data = np.int16(np.clip(wav_data, -1.0, 1.0) * 32767)
 
-            # Add silence (pause) after the sentence
-            silence = np.zeros(int(pause_duration * sample_rate), dtype=np.int16)
-            final_wav_data = np.concatenate([int16_wav_data, silence])
+            # --- FIX: The worker now ONLY saves the raw speech ---
+            write_wav(output_wav_path, sample_rate, int16_wav_data)
             
-            # Write the audio chunk to a WAV file
-            write_wav(output_wav_path, sample_rate, final_wav_data)
-            
-            # Calculate the duration in seconds (for LRC timing)
-            duration_sec = len(final_wav_data) / sample_rate
-            # Send result back to main process
+            # --- FIX: It now reports the duration of ONLY the speech ---
+            duration_sec = len(int16_wav_data) / sample_rate
             results_queue.put((idx, sentence_text, duration_sec, output_wav_path))
 
         except queue.Empty:
@@ -259,88 +254,84 @@ def tts_consumer(job_queue, results_queue, args):
 def main(args):
     """
     Main function that coordinates the entire audiobook creation process.
-    - Sets up output folders
-    - Starts the TTS worker process
-    - Extracts chapters from the EPUB
-    - Splits each chapter into chunks
-    - Sends jobs to the worker and collects results
-    - Assembles the final MP3 and LRC files for each chapter
-    - Embeds synchronized lyrics into the MP3 metadata
+    This is the definitive version with a persistent worker and a robust JSON checkpoint system.
     """
     start_time = time.time()
     
-    # Prepare output directories for the book and audio chapters
+    # --- 1. SETUP ---
     book_output_dir = os.path.join(os.getcwd(), args.book_title)
     audio_chapters_dir = os.path.join(book_output_dir, "audio_chapters")
     os.makedirs(audio_chapters_dir, exist_ok=True)
 
-    # --- Extract chapters from the EPUB file FIRST ---
-    chapters = extract_chapters_from_epub(args.epub_file, args.skip_start, args.skip_end)
-    total_chapters = len(chapters)
+    # Define the path for our central checkpoint file
+    progress_file_path = os.path.join(book_output_dir, "generation_progress.json")
 
-    # --- Now load or create the progress file ---
-    progress_path = os.path.join(book_output_dir, "progress.json")
-    progress_data = load_or_create_progress_file(progress_path, chapters)
+    # Step A: Parse the EPUB once to get the definitive list of all chapters
+    chapters_from_epub = extract_chapters_from_epub(args.epub_file, args.skip_start, args.skip_end)
+    if not chapters_from_epub:
+        print("No chapters found in EPUB. Exiting.")
+        return
 
+    # Step B: If --force_reprocess is used, delete the old progress file
+    if args.force_reprocess and os.path.exists(progress_file_path):
+        print("--force_reprocess flag detected. Deleting old progress file.")
+        os.remove(progress_file_path)
+        
+    # Step C: Load the progress file, or create a new one. This is our single source of truth.
+    progress_data = load_or_create_progress_file(progress_file_path, chapters_from_epub, args.book_title)
+
+    # Initialize the lightweight splitter and persistent worker process
     print("Initializing lightweight text splitter...")
-    splitter_tts = TTS(args.tts_model_name)  # Used only for sentence splitting, not for audio
+    splitter_tts = TTS(args.tts_model_name)
     print("Splitter ready.")
     
     print("\n--- Starting Persistent Worker Process ---")
-    job_queue = Queue(maxsize=64)      # Queue for sending jobs to the worker
-    results_queue = Queue(maxsize=64)  # Queue for receiving results from the worker
+    job_queue = Queue(maxsize=64)
+    results_queue = Queue(maxsize=64)
     consumer_process = Process(target=tts_consumer, args=(job_queue, results_queue, args))
     consumer_process.start()
 
-    # Extract chapters from the EPUB file
-    chapters = extract_chapters_from_epub(args.epub_file, args.skip_start, args.skip_end)
-    total_chapters = len(chapters)
-    
-    for chapter_info in chapters:
+    # --- MAIN GENERATION LOOP (NOW ITERATES OVER OUR PROGRESS FILE) ---
+    for chapter_progress in progress_data["chapters"]:
+        
+        # This check is now based on the JSON status, not os.path.exists
+        if chapter_progress["status"] == "complete":
+            print(f"\n>>> Chapter {chapter_progress['num']}: '{chapter_progress['title']}' is already marked as complete. Skipping.")
+            continue
+
+        # Find the full chapter details from the list we loaded at the start
+        chapter_info = next((c for c in chapters_from_epub if c["num"] == chapter_progress["num"]), None)
+        if not chapter_info:
+            print(f"Warning: Could not find chapter data for chapter number {chapter_progress['num']}. Skipping.")
+            continue
+        
         chapter_num = chapter_info["num"]
         chapter_title = chapter_info["title"]
         chapter_text = chapter_info["text"]
-
-        # Check progress file for this chapter's status
-        chapter_progress = next((c for c in progress_data["chapters"] if c["num"] == chapter_num), None)
-        if chapter_progress and chapter_progress.get("status") == "done":
-            print(f"Chapter {chapter_num} already marked as done in progress file. Skipping.")
-            continue
-
-        # Mark as in_progress before starting
-        update_progress_file(progress_path, chapter_num, "in_progress")
-
         chapter_audio_path = os.path.join(audio_chapters_dir, f"chapter_{chapter_num:04d}.mp3")
+
+        print(f"\n>>> Processing Chapter {chapter_num}/{len(progress_data['chapters'])}: {chapter_title}")
+
+        # Mark chapter as "in_progress" and save immediately
+        chapter_progress["status"] = "in_progress"
+        with open(progress_file_path, 'w', encoding='utf-8') as f:
+            json.dump(progress_data, f, indent=4)
+
+        # It includes the temp folder creation, sentence splitting, collector thread,
+        # producer loop, FFmpeg assembly, LRC creation, and Mutagen embedding.
         
-        print(f"\n>>> Processing Chapter {chapter_num}/{total_chapters}: {chapter_title}")
-
-        # Skip chapter if already processed and not forcing reprocess
-        if not args.force_reprocess and os.path.exists(chapter_audio_path):
-            print("Output file already exists. Skipping.")
-            continue
-
-        # Create a temporary folder for storing audio chunks for this chapter
         temp_chunk_folder = os.path.join(book_output_dir, "temp_audio_chunks")
-        if os.path.exists(temp_chunk_folder):
-            shutil.rmtree(temp_chunk_folder)  # Remove old temp folder if it exists
+        if os.path.exists(temp_chunk_folder): shutil.rmtree(temp_chunk_folder)
         os.makedirs(temp_chunk_folder)
         
-        # Combine chapter title and text for TTS (so title is read aloud)
         full_text_with_title = f"{chapter_title}\n\n{chapter_text}"
-        # Split the chapter into manageable chunks for TTS
         sentence_chunks = robust_sentence_splitter(full_text_with_title, splitter_tts.synthesizer, args.max_len)
         total_chunks = len(sentence_chunks)
 
-        # Prepare lists to store timestamps and file paths for each chunk
         chapter_timestamps = [None] * total_chunks
         sentence_files_ordered = [None] * total_chunks
 
-        # --- Collector thread: collects results from worker process ---
         def collect_results():
-            """
-            Runs in a separate thread.
-            Collects results from the worker process and stores them in order.
-            """
             for _ in range(len(sentence_chunks)):
                 try:
                     idx, text, duration, path = results_queue.get(timeout=args.collector_timeout)
@@ -353,71 +344,67 @@ def main(args):
         collector_thread = Thread(target=collect_results)
         collector_thread.start()
 
-        # --- Producer: sends jobs to worker process ---
         for i, chunk_info in enumerate(sentence_chunks):
             sentence_text = chunk_info["text"]
             is_para_end = chunk_info["is_para_end"]
-            # Use a longer pause at paragraph ends
             pause_duration = args.para_pause if is_para_end else args.pause
             output_wav_path = os.path.join(temp_chunk_folder, f"s_{i:04d}.wav")
-            # Send job to the worker process
             job_queue.put((i, sentence_text, output_wav_path, pause_duration))
             print(f"\r  > [Producer] Sent job {i+1}/{total_chunks} to queue.", end="")
 
         print("\n  > [Producer] All jobs sent. Waiting for results...")
-        collector_thread.join()  # Wait for all results to be collected
+        collector_thread.join()
         
         print("\n  > Assembling and finalizing chapter MP3...")
         
-        # --- Add extra silence between chunks for robustness ---
         sample_rate = splitter_tts.synthesizer.output_sample_rate
-        silence_duration_samples = int(args.pause * sample_rate)
-        silence_wav = np.zeros(silence_duration_samples, dtype=np.int16)
-        silence_file_path = os.path.join(temp_chunk_folder, "silence.wav")
-        write_wav(silence_file_path, sample_rate, silence_wav)
+        sent_pause_samples = int(args.pause * sample_rate)
+        sent_silence_wav = np.zeros(sent_pause_samples, dtype=np.int16)
+        sent_silence_path = os.path.join(temp_chunk_folder, "pause_sent.wav")
+        write_wav(sent_silence_path, sample_rate, sent_silence_wav)
+        
+        para_pause_samples = int(args.para_pause * sample_rate)
+        para_silence_wav = np.zeros(para_pause_samples, dtype=np.int16)
+        para_silence_path = os.path.join(temp_chunk_folder, "pause_para.wav")
+        write_wav(para_silence_path, sample_rate, para_silence_wav)
 
-        # --- Create filelist for ffmpeg concat ---
         filelist_path = os.path.join(temp_chunk_folder, "filelist.txt")
         with open(filelist_path, 'w', encoding='utf-8') as f:
-            for i, wav_file in enumerate(sentence_files_ordered):
+            for i, (wav_file, chunk_info) in enumerate(zip(sentence_files_ordered, sentence_chunks)):
                 if wav_file and os.path.exists(wav_file):
                     f.write(f"file '{os.path.basename(wav_file)}'\n")
-                    # Add a silence file after every chunk except the last one
                     if i < len(sentence_files_ordered) - 1:
-                        f.write(f"file '{os.path.basename(silence_file_path)}'\n")
+                        if chunk_info["is_para_end"]:
+                            f.write(f"file '{os.path.basename(para_silence_path)}'\n")
+                        else:
+                            f.write(f"file '{os.path.basename(sent_silence_path)}'\n")
         
-        # --- Use ffmpeg to concatenate all wavs and convert to mp3 ---
-        ffmpeg_command = [
-            'ffmpeg', '-y', '-f', 'concat', '-safe', '0',
-            '-i', os.path.basename(filelist_path),
-            '-c', 'libmp3lame', '-b:a', '192k', os.path.abspath(chapter_audio_path)
-        ]
+        ffmpeg_command = ['ffmpeg', '-y', '-f', 'concat', '-safe', '0', '-i', os.path.basename(filelist_path),'-c', 'libmp3lame', '-b:a', '192k', os.path.abspath(chapter_audio_path)]
         try:
             subprocess.run(ffmpeg_command, check=True, capture_output=True, cwd=temp_chunk_folder)
         except subprocess.CalledProcessError as e:
-            print(f"\n[ERROR] ffmpeg failed while assembling chapter. See logs above.")
+            print(f"\n[ERROR] ffmpeg failed. Chapter marked to be re-processed.")
+            chapter_progress["status"] = "pending"
+            with open(progress_file_path, 'w', encoding='utf-8') as f: json.dump(progress_data, f, indent=4)
             continue
 
-        # --- Generate LRC (lyrics) file for chapter ---
         chapter_lrc_path = chapter_audio_path.replace('.mp3', '.lrc')
         lrc_lines, current_time = [], 0.0
-        for entry in chapter_timestamps:
+        for i, entry in enumerate(chapter_timestamps):
             if entry and entry['text'] and entry['duration'] > 0:
                 lrc_lines.append(f"{format_lrc_timestamp(current_time)}{entry['text']}")
                 current_time += entry['duration']
-        with open(chapter_lrc_path, 'w', encoding='utf-8') as f:
-            f.write("\n".join(lrc_lines))
-        print(f"  > Saved LRC lyrics to: {os.path.basename(chapter_lrc_path)}")
-
-        # --- Embed LRC as SYLT (synchronized lyrics) in MP3 metadata ---
-        try:
-            audio = ID3(chapter_audio_path)
-        except Exception:
-            audio = ID3()
-            
-        lrc_text_for_embedding = "\n".join(lrc_lines)
+                if i < len(chapter_timestamps) - 1:
+                    is_para_end = sentence_chunks[i]["is_para_end"]
+                    current_time += args.para_pause if is_para_end else args.pause
+        
+        with open(chapter_lrc_path, 'w', encoding='utf-8') as f: f.write("\n".join(lrc_lines))
+        
+        try: audio = ID3(chapter_audio_path)
+        except Exception: audio = ID3()
+        with open(chapter_lrc_path, 'r', encoding='utf-8') as f: lrc_text = f.read()
         lrc_entries, lrc_pattern = [], re.compile(r"\[(\d+):(\d+)\.(\d+)\](.*)")
-        for line in lrc_text_for_embedding.splitlines():
+        for line in lrc_lines:
             match = lrc_pattern.match(line)
             if match:
                 minutes, seconds, hundredths = int(match.group(1)), int(match.group(2)), int(match.group(3))
@@ -425,22 +412,24 @@ def main(args):
                 lyric = match.group(4).strip()
                 lrc_entries.append((lyric, timestamp_ms))
         
-        sylt = SYLT(encoding=Encoding.UTF8, lang='eng', format=2, type=1, desc='', text=lrc_entries)
+        sylt = SYLT(encoding=Encoding.UTF8, lang='eng', format=2, type=1, desc='Lyrics', text=lrc_entries)
         audio.setall('SYLT', [sylt])
-        audio.save(v2_version=3)  # Save with v2.3 for max compatibility
-        print(f"  > Embedded lyrics directly into {os.path.basename(chapter_audio_path)}.")
-
-        # --- Clean up temp files ---
+        audio.save(chapter_audio_path, v2_version=3)
+        
         shutil.rmtree(temp_chunk_folder)
+
+        # After all steps for the chapter are successful, mark it as "complete"
+        chapter_progress["status"] = "complete"
+        with open(progress_file_path, 'w', encoding='utf-8') as f:
+            json.dump(progress_data, f, indent=4)
+        
         print(f"--- Successfully completed and finalized Chapter {chapter_num} ---")
+        # <<< END: FINAL CHECKPOINT UPDATE >>>
 
-        # Mark as done after finishing
-        update_progress_file(progress_path, chapter_num, "done")
-
-    # --- All chapters done ---
+    # --- 5. SHUTDOWN AND FINISH ---
     print("\n--- All chapters processed! Shutting down worker process... ---")
-    job_queue.put("STOP")  # Tell the worker process to exit
-    consumer_process.join()  # Wait for worker to finish
+    job_queue.put("STOP")
+    consumer_process.join()
     
     print("\n--- Project Complete! ---")
     total_time = time.time() - start_time
